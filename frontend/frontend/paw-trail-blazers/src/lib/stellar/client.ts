@@ -1,5 +1,12 @@
-import * as StellarSdk from '@stellar/stellar-sdk';
-import { STELLAR_CONFIG } from './config';
+/* src/lib/stellar/client.ts */
+import * as StellarSdk from "@stellar/stellar-sdk";
+import { STELLAR_CONFIG } from "./config";
+
+/**
+ * StellarClient — wrapper around Soroban RPC + contract operations
+ * - robust polling that tolerates "Bad union switch" / decode timing errors
+ * - simulation -> prepare -> sign -> send flow with a raw RPC fallback
+ */
 
 export class StellarClient {
   private server: StellarSdk.SorobanRpc.Server;
@@ -10,26 +17,21 @@ export class StellarClient {
     this.contract = new StellarSdk.Contract(STELLAR_CONFIG.contractId);
   }
 
-  // Get account details
   async getAccount(publicKey: string) {
     try {
       return await this.server.getAccount(publicKey);
     } catch (error) {
-      console.error('Error fetching account:', error);
+      console.error("Error fetching account:", error);
       throw error;
     }
   }
 
-  // Invoke contract method (read-only) - FOR PRODUCTION USE
+  // Read-only contract invocation using simulation
   async invokeContractMethod(method: string, params: StellarSdk.xdr.ScVal[] = []) {
     try {
-      // For read-only contract calls, we need to simulate with a source account
-      // We'll use a temporary keypair just for building the transaction
       const tempKeypair = StellarSdk.Keypair.random();
-      
-      // Create a temporary account object (not on chain, just for transaction building)
-      const sourceAccount = new StellarSdk.Account(tempKeypair.publicKey(), '0');
-      
+      const sourceAccount = new StellarSdk.Account(tempKeypair.publicKey(), "0");
+
       const operation = this.contract.call(method, ...params);
 
       const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
@@ -40,36 +42,41 @@ export class StellarClient {
         .setTimeout(30)
         .build();
 
-      // Simulate the transaction to get the result
       const response = await this.server.simulateTransaction(transaction);
-      
-      if (StellarSdk.SorobanRpc.Api.isSimulationSuccess(response)) {
-        return StellarSdk.scValToNative(response.result!.retval);
+
+      // NOTE: Use the SDK helpers if available
+      if ((StellarSdk as any).SorobanRpc && (StellarSdk as any).SorobanRpc.Api) {
+        const Api = (StellarSdk as any).SorobanRpc.Api;
+        if (Api.isSimulationSuccess(response)) {
+          return StellarSdk.scValToNative(response.result!.retval);
+        }
+        if (Api.isSimulationError(response)) {
+          console.error("Simulation error:", response);
+          throw new Error(`Simulation failed: ${JSON.stringify(response)}`);
+        }
       }
-      
-      if (StellarSdk.SorobanRpc.Api.isSimulationError(response)) {
-        console.error('Simulation error:', response);
-        throw new Error(`Simulation failed: ${response.error}`);
+
+      // Fallback: try to inspect raw response
+      if ((response as any)?.result?.retval) {
+        return StellarSdk.scValToNative((response as any).result.retval);
       }
-      
-      throw new Error('Contract invocation failed');
+
+      throw new Error("Contract invocation failed (unknown simulation response)");
     } catch (error) {
       console.error(`Error invoking ${method}:`, error);
       throw error;
     }
   }
 
-  // Build and submit transaction - FOR REAL TRANSACTIONS
+  // Build, prepare (simulation), request signature, and submit to network.
   async buildAndSubmitTransaction(
     sourcePublicKey: string,
     operation: StellarSdk.xdr.Operation,
     signerFunction: (tx: StellarSdk.Transaction) => Promise<string>
   ) {
     try {
-      // Get the actual source account from the blockchain
       const sourceAccount = await this.getAccount(sourcePublicKey);
-      
-      // Build the transaction
+
       const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
         fee: StellarSdk.BASE_FEE,
         networkPassphrase: STELLAR_CONFIG.networkPassphrase,
@@ -78,127 +85,171 @@ export class StellarClient {
         .setTimeout(30)
         .build();
 
-      console.log('Simulating transaction...');
-      
-      // Simulate transaction first
+      console.log("Simulating transaction...");
       const simulationResponse = await this.server.simulateTransaction(transaction);
-      
-      if (StellarSdk.SorobanRpc.Api.isSimulationError(simulationResponse)) {
-        console.error('Simulation error:', simulationResponse);
-        throw new Error(`Simulation failed: ${simulationResponse.error}`);
+
+      // If simulation reports an error, throw early
+      if ((StellarSdk as any).SorobanRpc?.Api?.isSimulationError?.(simulationResponse)) {
+        console.error("Simulation error:", simulationResponse);
+        throw new Error(`Simulation failed: ${JSON.stringify(simulationResponse)}`);
       }
 
-      if (!StellarSdk.SorobanRpc.Api.isSimulationSuccess(simulationResponse)) {
-        throw new Error('Simulation was not successful');
+      if (!(StellarSdk as any).SorobanRpc?.Api?.isSimulationSuccess?.(simulationResponse)) {
+        // If SDK doesn't have helpers, try fallback check
+        if (!(simulationResponse as any)?.result) {
+          throw new Error("Simulation was not successful (no result returned).");
+        }
       }
 
-      console.log('Simulation successful, preparing transaction...');
+      console.log("Simulation successful, preparing transaction...");
 
-      // Prepare transaction from simulation (adds auth and resource fees)
-      const preparedTransaction = StellarSdk.SorobanRpc.assembleTransaction(
-        transaction,
-        simulationResponse
-      ).build();
+      // Assemble transaction (set footprint, fees)
+      let preparedTransaction: StellarSdk.Transaction;
+      try {
+        preparedTransaction = (StellarSdk as any).SorobanRpc.assembleTransaction(
+          transaction,
+          simulationResponse
+        ).build();
+      } catch (err) {
+        console.error("assembleTransaction failed:", err);
+        // If assembleTransaction isn't available or fails, try using the original transaction.
+        // It's better to attempt sign + send than to fail completely in dev/test.
+        preparedTransaction = transaction;
+      }
 
-      console.log('Transaction prepared, requesting signature...');
+      console.log("Transaction prepared, requesting signature...");
 
-      // Sign transaction using Freighter wallet
+      // signerFunction may expect Transaction or XDR string; support both.
       const signedXdr = await signerFunction(preparedTransaction);
-      const signedTx = StellarSdk.TransactionBuilder.fromXDR(
-        signedXdr,
-        STELLAR_CONFIG.networkPassphrase
-      ) as StellarSdk.Transaction;
-
-      console.log('Transaction signed, submitting to network...');
-
-      // Submit the signed transaction to the network
-      const sendResponse = await this.server.sendTransaction(signedTx);
-      
-      console.log('Transaction submitted:', sendResponse);
-
-      if (sendResponse.status === 'PENDING') {
-        console.log('Transaction pending, polling for result...');
-        return await this.pollTransactionStatus(sendResponse.hash);
+      if (!signedXdr || typeof signedXdr !== "string") {
+        throw new Error("signerFunction did not return a signed XDR string");
       }
 
-      if (sendResponse.status === 'ERROR') {
-        throw new Error(`Transaction error: ${JSON.stringify(sendResponse)}`);
+      // Convert signed XDR to Transaction object
+      let signedTx: StellarSdk.Transaction;
+      try {
+        signedTx = StellarSdk.TransactionBuilder.fromXDR(
+          signedXdr,
+          STELLAR_CONFIG.networkPassphrase
+        ) as StellarSdk.Transaction;
+      } catch (err) {
+        // If parsing fails, try to send raw XDR via RPC fallback
+        console.warn("Failed to parse signedXdr into Transaction object:", err);
+        return await this.sendRawXdrFallback(signedXdr);
       }
 
-      throw new Error(`Unexpected transaction status: ${sendResponse.status}`);
+      console.log("Transaction signed, submitting to network...");
+
+      // Primary path: SDK sendTransaction
+      try {
+        const sendResponse = await this.server.sendTransaction(signedTx);
+        console.log("sendResponse (SDK):", sendResponse);
+
+        if ((sendResponse as any)?.status === "PENDING") {
+          return await this.pollTransactionStatus((sendResponse as any).hash, parseInt(process.env.VITE_MAX_RETRIES || "60"), 4000);
+        } else if ((sendResponse as any)?.status === "ERROR") {
+          throw new Error(`Transaction error: ${JSON.stringify(sendResponse)}`);
+        } else {
+          // some RPCs return full object immediately
+          return sendResponse;
+        }
+      } catch (sdkSendErr) {
+        console.warn("SDK sendTransaction threw, trying RPC fallback:", sdkSendErr);
+        // fallback: send via raw RPC
+        return await this.sendRawXdrFallback(signedXdr);
+      }
     } catch (error) {
-      console.error('Error building/submitting transaction:', error);
+      console.error("Error building/submitting transaction:", error);
       throw error;
     }
   }
 
-  // Poll transaction status until complete
-// Replace the existing method in StellarClient with this implementation
-private async pollTransactionStatus(hash: string, maxAttempts = 30, delayMs = 4000) {
-  console.log(`Polling transaction ${hash}...`);
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    // wait between attempts except the first
-    if (attempt > 1) {
-      await new Promise((res) => setTimeout(res, delayMs));
-    }
-
+  // Send signed XDR via JSON-RPC fallback to the Soroban server.
+  private async sendRawXdrFallback(signedXdr: string) {
     try {
-      // Try to fetch the full transaction status/result from the Soroban RPC.
-      // Note: getTransaction may sometimes throw if the RPC hasn't produced a
-      // final decodable result yet (this is where "Bad union switch: 4" can happen).
-      const txResponse = await this.server.getTransaction(hash);
+      const rpcUrl = STELLAR_CONFIG.rpcUrl;
+      const res = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "send_transaction",
+          params: { tx: signedXdr },
+        }),
+      });
+      const raw = await res.json();
+      console.log("RPC fallback response:", raw);
 
-      console.log(`Attempt ${attempt}: got transaction response. status=${txResponse.status}`);
+      // If raw.result exists and indicates PENDING, poll the hash
+      const hash = raw?.result?.hash || raw?.result?.id || raw?.hash;
+      const status = raw?.result?.status || raw?.status;
 
-      // If Soroban returned a final status, act on it
-      if (txResponse.status === "SUCCESS") {
-        console.log("Transaction successful!", txResponse);
-        return txResponse;
+      if (status === "PENDING" && hash) {
+        return await this.pollTransactionStatus(hash, parseInt(process.env.VITE_MAX_RETRIES || "60"), 4000);
       }
 
-      if (txResponse.status === "FAILED") {
-        console.error("Transaction failed:", txResponse);
-        throw new Error(`Transaction failed: ${JSON.stringify(txResponse)}`);
+      if (status === "ERROR") {
+        throw new Error(`RPC send_transaction error: ${JSON.stringify(raw)}`);
       }
 
-      // If status is NOT_FOUND or PENDING or other non-final state, keep polling
-      console.log(`Attempt ${attempt}: transaction status is ${txResponse.status} (waiting).`);
-    } catch (err: any) {
-      // Common decoding error when calling getTransaction too early:
-      // "TypeError: Bad union switch: 4" (or other parsing errors)
-      // We'll log and continue polling; don't treat as fatal yet.
-      //
-      // If the error looks like a genuine network / permission error, rethrow.
-      const message = err?.message ?? String(err);
-      console.log(`Attempt ${attempt} polling error (will retry):`, message);
-
-      // If it's clearly an fatal network or auth error, throw immediately:
-      if (
-        message.includes("ENOTFOUND") ||
-        message.includes("network") ||
-        message.includes("403") ||
-        message.includes("401") ||
-        message.includes("permission")
-      ) {
-        // Re-throw for these cases
-        console.error("Network/auth error while polling transaction:", err);
-        throw err;
-      }
-
-      // otherwise continue polling (we expect transient parse/timing errors)
+      return raw;
+    } catch (err) {
+      console.error("RPC fallback send failed:", err);
+      throw err;
     }
   }
 
-  throw new Error(`Transaction timeout after ${maxAttempts} attempts. Hash: ${hash}`);
-}
+  // Poll transaction status — tolerant of transient decode errors like "Bad union switch"
+  private async pollTransactionStatus(hash: string, maxAttempts = 30, delayMs = 4000) {
+    console.log(`Polling transaction ${hash}... (maxAttempts=${maxAttempts})`);
 
-  // Helper: Convert contract data to native JavaScript types
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (attempt > 1) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+
+      try {
+        const txResponse = await this.server.getTransaction(hash);
+
+        console.log(`Attempt ${attempt}: got transaction response. status=${txResponse.status}`);
+
+        if (txResponse.status === "SUCCESS") {
+          return txResponse;
+        }
+        if (txResponse.status === "FAILED") {
+          throw new Error(`Transaction failed: ${JSON.stringify(txResponse)}`);
+        }
+
+        // NOT_FOUND or PENDING -> continue polling
+        console.log(`Attempt ${attempt}: transaction status is ${txResponse.status} (waiting).`);
+      } catch (err: any) {
+        const msg = err?.message ?? String(err);
+        console.log(`Attempt ${attempt} polling error (will retry):`, msg);
+
+        // treat known XDR parse timing errors as transient (retry)
+        if (msg.includes("Bad union switch") || msg.includes("union switch") || msg.includes("invalid XDR") || msg.includes("unexpected")) {
+          // transient: continue to next attempt
+          continue;
+        }
+
+        // network/auth errors -> bail out
+        if (msg.includes("ENOTFOUND") || msg.includes("403") || msg.includes("401") || msg.includes("permission") || msg.includes("network")) {
+          console.error("Network/auth error while polling transaction:", err);
+          throw err;
+        }
+
+        // other errors: log and continue (tolerant)
+        console.warn("Polling got unknown error (retrying):", err);
+      }
+    }
+
+    throw new Error(`Transaction timeout after ${maxAttempts} attempts. Hash: ${hash}`);
+  }
+
   scValToNative(scVal: StellarSdk.xdr.ScVal): any {
     return StellarSdk.scValToNative(scVal);
   }
 }
 
 export const stellarClient = new StellarClient();
-
-

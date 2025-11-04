@@ -1,51 +1,66 @@
-import {
-  isConnected,
-  getPublicKey,
-  signTransaction,
-  requestAccess,
-} from "@stellar/freighter-api";
+/* src/lib/stellar/wallet.ts */
+import { isConnected, requestAccess, getPublicKey, signTransaction } from "@stellar/freighter-api";
+
+/**
+ * Minimal Wallet manager using Freighter's API.
+ * Exports walletManager with:
+ * - isWalletConnected()
+ * - connectWallet()
+ * - signTransaction(xdr)
+ */
 
 const STELLAR_CONFIG = {
-  networkPassphrase: "Test SDF Network ; September 2015",
+  networkPassphrase: String(import.meta.env.VITE_STELLAR_NETWORK).toLowerCase().includes("future")
+    ? String(import.meta.env.VITE_NETWORK_PASSPHRASE || "Test SDF Network ; September 2015")
+    : String(import.meta.env.VITE_NETWORK_PASSPHRASE || "Test SDF Network ; September 2015"),
 };
 
 export class WalletManager {
-  // Check if Freighter wallet is installed and connected
   async isWalletConnected(): Promise<boolean> {
-    return await isConnected();
+    try {
+      return await isConnected();
+    } catch {
+      return false;
+    }
   }
 
-  // Connect to Freighter wallet and get user's public key
   async connectWallet(): Promise<string> {
-    const isWalletAvailable = await this.isWalletConnected();
-    if (typeof window.freighterApi === "undefined") {
-        console.warn("Freighter API not yet injected — try refreshing the page.");
+    const installed = await this.isWalletConnected();
+    if (!installed) {
+      throw new Error("Freighter wallet not detected. Please install or open it.");
     }
 
-    if (!isWalletAvailable) {
-      throw new Error("Freighter wallet is not installed. Please install it first.");
+    // Ask for permission (prompts user)
+    try {
+      await requestAccess();
+    } catch (err) {
+      console.error("Freighter requestAccess rejected:", err);
+      throw new Error("Freighter connection denied by user");
     }
 
-    // Request permission to access the wallet
-    await requestAccess();
-
-    // Get the public key (wallet address)
-    const publicKey = await getPublicKey();
-    console.log("Connected wallet:", publicKey);
-    return publicKey;
+    // Get public key
+    try {
+      const pub = await getPublicKey();
+      if (!pub) throw new Error("Freighter returned empty public key");
+      return pub;
+    } catch (err) {
+      console.error("getPublicKey failed:", err);
+      throw err;
+    }
   }
 
-  
-
-  // Sign a transaction XDR using Freighter
   async signTransaction(xdr: string): Promise<string> {
-    const signedXdr = await signTransaction(xdr, {
-      networkPassphrase: STELLAR_CONFIG.networkPassphrase,
-    });
-    console.log("Signed Transaction XDR:", signedXdr);
-    return signedXdr;
+    try {
+      // freighter signTransaction expects XDR string + options
+      const signed = await signTransaction(xdr, {
+        networkPassphrase: STELLAR_CONFIG.networkPassphrase,
+      });
+      return signed;
+    } catch (err) {
+      console.error("Freighter signTransaction failed:", err);
+      throw err;
+    }
   }
 }
 
-// Export a ready-to-use wallet manager instance
 export const walletManager = new WalletManager();

@@ -49,6 +49,23 @@ export function useFeeders() {
       
       const feedersData = await Promise.all(feederPromises);
       console.log('Fetched feeders from blockchain:', feedersData);
+
+      const parsedFeeders: FeederProfile[] = feedersData.map((f: any, i: number) => ({
+  feeder_id: f.feeder_id || i + 1,
+  name: f.name || f[0] || "Unnamed Feeder",
+  organization_type: f.organization_type || f[1] || "Unknown Organization",
+  location: f.location || f[2] || "Unknown Location",
+  wallet_address: f.wallet_address || f[3] || "Unknown Wallet",
+  registration_number: f.registration_number || f[4] || "N/A",
+  contact_info: f.contact_info || f[5] || "Not Provided",
+  registered_date: f.registered_date || Date.now(),
+  is_verified: f.is_verified ?? false,
+  total_received: f.total_received?.toString?.() || "0",
+  total_spent: f.total_spent?.toString?.() || "0",
+}));
+setFeeders(parsedFeeders);
+
+
       
       setFeeders(feedersData);
     } catch (error) {

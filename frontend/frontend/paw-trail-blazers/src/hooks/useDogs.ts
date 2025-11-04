@@ -77,7 +77,7 @@ export function useDogs() {
       const response = await stellarClient.buildAndSubmitTransaction(
         walletAddress,
         operation,
-        async (tx) => await walletManager.signTransaction(tx)
+        async (tx) => await walletManager.signTransaction(tx.toXDR())
       );
 
       console.log('Dog registered successfully:', response);
@@ -118,7 +118,7 @@ export function useDogs() {
       const response = await stellarClient.buildAndSubmitTransaction(
         walletAddress,
         operation,
-        async (tx) => await walletManager.signTransaction(tx)
+        async (tx) => await walletManager.signTransaction(tx.toXDR())
       );
 
       console.log('Dog health updated successfully:', response);
